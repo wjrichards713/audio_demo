@@ -71,14 +71,44 @@ class MainActivity : AppCompatActivity() {
                 var userName = binding.editTextUserName.text.toString()
                 var agencyName = binding.editTextAgencyName.text.toString()
                 var affiliationID = binding.editTextAffiliationId.text.toString()
-                webSocketManager = WebSocketClientRtpAudioStream(this,url)
-                webSocketManager!!.setOnMessageListener(socketListener)
-                webSocketManager!!.userName = userName
-                webSocketManager!!.agencyName = agencyName
-                webSocketManager!!.affiliationId = affiliationID
-                binding.buttonConnectWebSocket.setText("Disconnect WebSocket")
-                binding.buttonConnectWebSocket.backgroundTintList = ColorStateList.valueOf(Color.parseColor("#F44336"))
-                webSocketConnected()
+                fun isValid(): Boolean {
+                    var isValid = true
+                    if (url.isEmpty()){
+                        isValid = false
+                        binding.editTextWebSocketUrl.error = "Required"
+                    }
+                    else
+                        binding.editTextWebSocketUrl.error = null
+                    if (userName.isEmpty()){
+                        isValid = false
+                        binding.editTextUserName.error = "Required"
+                    }
+                    else
+                        binding.editTextUserName.error = null
+                    if (agencyName.isEmpty()){
+                        isValid = false
+                        binding.editTextAgencyName.error = "Required"
+                    }
+                    else
+                        binding.editTextAgencyName.error = null
+                    if (affiliationID.isEmpty()){
+                        isValid = false
+                        binding.editTextAffiliationId.error = "Required"
+                    }
+                    else
+                        binding.editTextAffiliationId.error = null
+                    return isValid
+                }
+               if (isValid()){
+                   webSocketManager = WebSocketClientRtpAudioStream(this,url)
+                   webSocketManager!!.setOnMessageListener(socketListener)
+                   webSocketManager!!.userName = userName
+                   webSocketManager!!.agencyName = agencyName
+                   webSocketManager!!.affiliationId = affiliationID
+                   binding.buttonConnectWebSocket.setText("Disconnect WebSocket")
+                   binding.buttonConnectWebSocket.backgroundTintList = ColorStateList.valueOf(Color.parseColor("#F44336"))
+                   webSocketConnected()
+               }
             }
 
         }
