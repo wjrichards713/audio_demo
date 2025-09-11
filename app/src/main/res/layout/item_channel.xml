@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/llRoot"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:layout_marginTop="7dp"
+    android:gravity="center_vertical"
+    android:background="@drawable/section_background"
+    android:backgroundTint="#C6F8C8"
+    android:padding="5dp">
+
+    <!-- Channel Name -->
+    <TextView
+        android:id="@+id/tvChannelName"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:text="Channel 555"
+        android:gravity="center_vertical"
+        android:lines="2"
+        android:ellipsize="end"
+        android:textSize="16sp"
+        android:textColor="@android:color/black" />
+
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="match_parent"
+        android:layout_gravity="end"
+        android:orientation="horizontal">
+        <!-- Connect Button -->
+        <Button
+            android:id="@+id/btnConnect"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Connect"
+            android:textAllCaps="false"
+            android:backgroundTint="#3F51B5" />
+
+        <!-- Start Audio Button -->
+        <Button
+            android:id="@+id/btnStartAudio"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="5dp"
+            android:text="Start Audio"
+            android:textAllCaps="false"
+            android:backgroundTint="#4CAF50" />
+
+        <!-- Remove Button -->
+        <Button
+            android:id="@+id/btnRemove"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="5dp"
+            android:text="Remove"
+            android:textAllCaps="false"
+            android:backgroundTint="#F44336" />
+    </LinearLayout>
+
+
+</LinearLayout>
