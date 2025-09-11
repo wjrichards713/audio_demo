@@ -43,7 +43,6 @@ class MainActivity : AppCompatActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-
         init()
     }
 
@@ -99,12 +98,12 @@ class MainActivity : AppCompatActivity() {
     private fun webSocketConnected(){
         binding.tvWebSocketStatus.text = "WebSocket connected"
         binding.tvWebSocketStatus.setTextColor(Color.parseColor("#4CAF50"))
-        //binding.llChannels.isVisible = true
+        binding.llChannels.isVisible = true
     }
     private fun webSocketDisconnected(){
         binding.tvWebSocketStatus.text = "WebSocket not connected"
         binding.tvWebSocketStatus.setTextColor(Color.parseColor("#F44336"))
-        //binding.llChannels.isVisible = false
+        binding.llChannels.isVisible = false
         webSocketManager?.let {
             it.disconnect()
             webSocketManager = null
