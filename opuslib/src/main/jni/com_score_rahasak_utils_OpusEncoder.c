@@ -17,6 +17,9 @@ const int MAX_PAYLOAD_BYTES = 1500;
 
 JNIEXPORT jboolean JNICALL Java_com_example_opuslib_utils_OpusEncoder_nativeInitEncoder (JNIEnv *env, jobject obj, jint samplingRate, jint numberOfChannels, jint frameSize)
 {
+	(void)env; // Suppress unused parameter warning
+	(void)obj; // Suppress unused parameter warning
+	
 	ENCODING_FRAME_SIZE = frameSize;
 	ENCODING_SAMPLING_RATE = samplingRate;
 	ENCODING_CHANNELS = numberOfChannels;
@@ -36,7 +39,11 @@ JNIEXPORT jboolean JNICALL Java_com_example_opuslib_utils_OpusEncoder_nativeInit
 
 JNIEXPORT jint JNICALL Java_com_example_opuslib_utils_OpusEncoder_nativeEncodeBytes (JNIEnv *env, jobject obj, jshortArray in, jbyteArray out)
 {
+	(void)obj; // Suppress unused parameter warning
+	
 	jint inputArraySize = (*env)->GetArrayLength(env, in);
+	(void)inputArraySize; // Suppress unused variable warning
+	
 	jint outputArraySize = (*env)->GetArrayLength(env, out);
 
 	jshort* audioSignal = (*env)->GetShortArrayElements(env, in, 0);
@@ -48,7 +55,7 @@ JNIEXPORT jint JNICALL Java_com_example_opuslib_utils_OpusEncoder_nativeEncodeBy
 	{
 		if (dataArraySize <= outputArraySize)
 		{
-			(*env)->SetByteArrayRegion(env,out,0,dataArraySize,data);
+			(*env)->SetByteArrayRegion(env,out,0,dataArraySize,(const jbyte*)data);
 		}
 		else
 		{
@@ -66,10 +73,10 @@ JNIEXPORT jint JNICALL Java_com_example_opuslib_utils_OpusEncoder_nativeEncodeBy
 
 JNIEXPORT jboolean JNICALL Java_com_example_opuslib_utils_OpusEncoder_nativeReleaseEncoder (JNIEnv *env, jobject obj)
 {
+	(void)env; // Suppress unused parameter warning
+	(void)obj; // Suppress unused parameter warning
+	
     free(enc);
 
     return 1;
 }
-
-
-

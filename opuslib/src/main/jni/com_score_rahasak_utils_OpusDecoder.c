@@ -17,6 +17,9 @@ int FRAME_SIZE;
 
 JNIEXPORT jboolean JNICALL Java_com_example_opuslib_utils_OpusDecoder_nativeInitDecoder (JNIEnv *env, jobject obj, jint samplingRate, jint numberOfChannels, jint frameSize)
 {
+	(void)env; // Suppress unused parameter warning
+	(void)obj; // Suppress unused parameter warning
+	
 	FRAME_SIZE = frameSize;
 	SAMPLING_RATE = samplingRate;
 	CHANNELS = numberOfChannels;
@@ -36,12 +39,14 @@ JNIEXPORT jboolean JNICALL Java_com_example_opuslib_utils_OpusDecoder_nativeInit
 
 JNIEXPORT jint JNICALL Java_com_example_opuslib_utils_OpusDecoder_nativeDecodeBytes (JNIEnv *env, jobject obj, jbyteArray in, jshortArray out)
 {
+	(void)obj; // Suppress unused parameter warning
+	
 	jint inputArraySize = (*env)->GetArrayLength(env, in);
 	jint outputArraySize = (*env)->GetArrayLength(env, out);
 
 	jbyte* encodedData = (*env)->GetByteArrayElements(env, in, 0);
 	opus_int16 *data = (opus_int16*)calloc(outputArraySize,sizeof(opus_int16));
-	int decodedDataArraySize = opus_decode(dec, encodedData, inputArraySize, data, FRAME_SIZE, 0);
+	int decodedDataArraySize = opus_decode(dec, (const unsigned char*)encodedData, inputArraySize, data, FRAME_SIZE, 0);
 
 	if (decodedDataArraySize >=0)
 	{
@@ -65,8 +70,10 @@ JNIEXPORT jint JNICALL Java_com_example_opuslib_utils_OpusDecoder_nativeDecodeBy
 
 JNIEXPORT jboolean JNICALL Java_com_example_opuslib_utils_OpusDecoder_nativeReleaseDecoder (JNIEnv *env, jobject obj)
 {
+	(void)env; // Suppress unused parameter warning
+	(void)obj; // Suppress unused parameter warning
+	
     free(dec);
 
     return 1;
 }
-
