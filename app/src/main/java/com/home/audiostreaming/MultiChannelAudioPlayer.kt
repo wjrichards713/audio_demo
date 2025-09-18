@@ -213,6 +213,7 @@ class MultiChannelAudioPlayer {
             .setAudioFormat(
                 AudioFormat.Builder()
                     .setSampleRate(SAMPLE_RATE)
+<<<<<<< HEAD
                     .setEncoding(AUDIO_FORMAT)
                     .setChannelMask(CHANNEL_CONFIG)
                     .build()
@@ -241,10 +242,48 @@ class MultiChannelAudioPlayer {
                     listener?.onError("Mixing error: ${e.message}")
                 }
             }
+=======
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                    .build()
+            )
+            .setBufferSizeInBytes(minBufferSize)
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+        
+        audioTracks[channelId] = audioTrack
+    }
+    
+    /**
+     * Decode Opus audio data for a specific channel
+     */
+    private fun decodeOpus(channelId: String, encodedData: ByteArray): ShortArray {
+        val decoder = opusDecoders[channelId] ?: return ShortArray(0)
+        val decodedData = ShortArray(4800) // Standard Opus frame size
+        val size = decoder.decode(encodedData, decodedData)
+        return if (size > 0) decodedData.copyOf(size) else ShortArray(0)
+    }
+    
+    /**
+     * Decrypt AES/GCM encrypted data
+     */
+    private fun decryptAES(encryptedData: ByteArray, key: SecretKey): ByteArray {
+        return try {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            val iv = encryptedData.copyOfRange(0, 12)
+            val actualEncryptedData = encryptedData.copyOfRange(12, encryptedData.size)
+            
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
+            cipher.doFinal(actualEncryptedData)
+        } catch (e: Exception) {
+            Log.e("MultiChannelAudio", "Decryption error: ${e.message}")
+            ByteArray(0)
+>>>>>>> 6587381 (update: logic to play through multi-channel)
         }
     }
     
     /**
+<<<<<<< HEAD
      * Mixes audio from all active channels and plays the result.
      */
     private suspend fun mixAndPlayAudio() {
@@ -319,6 +358,9 @@ class MultiChannelAudioPlayer {
      * 
      * @param monoData Mono audio data
      * @return Stereo audio data
+=======
+     * Convert mono PCM data to stereo
+>>>>>>> 6587381 (update: logic to play through multi-channel)
      */
     private fun convertMonoToStereo(monoData: ShortArray): ShortArray {
         val stereoData = ShortArray(monoData.size * 2)
@@ -330,6 +372,7 @@ class MultiChannelAudioPlayer {
     }
     
     /**
+<<<<<<< HEAD
      * Converts ShortArray to ByteArray for AudioTrack.
      * 
      * @param shortArray ShortArray to convert
@@ -378,4 +421,24 @@ class MultiChannelAudioPlayer {
         stopPlayback()
         coroutineScope.cancel()
     }
+=======
+     * Get channel statistics
+     */
+    fun getChannelStats(channelId: String): Map<String, Any>? {
+        val channelData = activeChannels[channelId] ?: return null
+        return mapOf(
+            "packetsReceived" to channelData.packetsReceived,
+            "packetsDropped" to channelData.packetsDropped,
+            "isActive" to channelData.isActive,
+            "volume" to channelData.volume,
+            "jitterBufferSize" to (jitterBuffers[channelId]?.size ?: 0),
+            "lastPacketTime" to channelData.lastPacketTime
+        )
+    }
+    
+    /**
+     * Get all active channel IDs
+     */
+    fun getActiveChannels(): Set<String> = activeChannels.keys.toSet()
+>>>>>>> 6587381 (update: logic to play through multi-channel)
 }

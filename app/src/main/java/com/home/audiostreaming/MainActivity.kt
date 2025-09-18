@@ -267,9 +267,14 @@ class MainActivity : AppCompatActivity() {
 
         override fun onBindViewHolder(holder: ChannelViewHolder, position: Int) {
             val channel = channels[position]
-            holder.binding.tvChannelName.text = "Channel ID: ${channel.roomName}"
+            holder.binding.tvChannelName.text = "Channel ID: ${channel.roomName} (Vol: ${(channel.volume * 100).toInt()}%)"
             holder.binding.llRoot.backgroundTintList = ColorStateList.valueOf(Color.parseColor(if (channel.producerIsTalking) "#C6F8C8" else "#F6F6F6"))
             holder.binding.btnStartAudio.isVisible = !channel.producerIsTalking
+            
+            // Show/hide volume controls based on connection status
+            holder.binding.btnVolumeUp.isVisible = channel.isJoined
+            holder.binding.btnVolumeDown.isVisible = channel.isJoined
+            
             if (channel.isJoined){
                 holder.binding.btnConnect.text = "Disconnect"
                 holder.binding.btnConnect.backgroundTintList = ColorStateList.valueOf(Color.parseColor("#F44336"))
@@ -322,6 +327,23 @@ class MainActivity : AppCompatActivity() {
                     channel.producerIsTalking = false
                     webSocketManager!!.sendDisconnect(channel)
                     channel.members.clear()
+                    notifyItemChanged(position)
+                }
+            }
+            
+            // Add volume control
+            holder.binding.btnVolumeUp.setOnClickListener {
+                if (channel.isJoined) {
+                    channel.volume = (channel.volume + 0.1f).coerceAtMost(1.0f)
+                    webSocketManager!!.setChannelVolume(channel.roomID ?: "", channel.volume)
+                    notifyItemChanged(position)
+                }
+            }
+            
+            holder.binding.btnVolumeDown.setOnClickListener {
+                if (channel.isJoined) {
+                    channel.volume = (channel.volume - 0.1f).coerceAtLeast(0.0f)
+                    webSocketManager!!.setChannelVolume(channel.roomID ?: "", channel.volume)
                     notifyItemChanged(position)
                 }
             }

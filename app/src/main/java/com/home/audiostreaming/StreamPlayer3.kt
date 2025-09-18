@@ -85,8 +85,9 @@ class StreamPlayer3(
 
     private fun processIncomingPacket(packet: DatagramPacket, keyAES: SecretKeySpec) {
         try {
-            val jsonObj = JSONObject(String(packet.data, Charsets.UTF_8))
-            Log.e("StreamPlayer", "${jsonObj.toString()}")
+            val rawJson = String(packet.data, 0, packet.length, Charsets.UTF_8)
+            Log.d("StreamPlayer", "RX audio packet JSON: ${rawJson}")
+            val jsonObj = JSONObject(rawJson)
             val channelID = jsonObj.optString("channel_id")
             if (jsonObj.has("type") && jsonObj.optString("type") == "audio") {
                 val base64Decoded = Base64.decode(jsonObj.optString("data"), Base64.DEFAULT)

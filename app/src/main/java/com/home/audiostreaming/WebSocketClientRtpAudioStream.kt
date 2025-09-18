@@ -33,7 +33,7 @@ class WebSocketClientRtpAudioStream(
     private var webSocket: WebSocket? = null
     private val sharedSocket = DatagramSocket().apply { broadcast = true }
 
-    private var streamPlayer: StreamPlayer3? = null
+    private var multiChannelPlayer: MultiChannelAudioPlayer? = null
     private var streamRecorder: StreamRecorder? = null
     private var keepAliveJob: Job? = null
 
@@ -84,8 +84,8 @@ class WebSocketClientRtpAudioStream(
 
     fun disconnect() {
         stopKeepAlive()
-        streamPlayer?.stopPlaying()
-        streamPlayer = null
+        multiChannelPlayer?.stop()
+        multiChannelPlayer = null
         streamRecorder?.stopRecording()
         streamRecorder = null
         sharedSocket.close()
@@ -114,6 +114,9 @@ class WebSocketClientRtpAudioStream(
         room.isJoined = true
         send(request.toString())
         connectStreamSocket(room)
+        
+        // Add channel to multi-channel player
+        multiChannelPlayer?.addChannel(room.roomID ?: "", room.volume)
     }
 
     fun sendTransmitStarted(room: Room) {
@@ -176,6 +179,10 @@ class WebSocketClientRtpAudioStream(
             })
         }
         send(request.toString())
+        
+        // Remove channel from multi-channel player
+        multiChannelPlayer?.removeChannel(room.roomID ?: "")
+        
         disconnectStreamSocket(room)
     }
     fun disconnectStreamSocket(room: Room){
@@ -189,38 +196,33 @@ class WebSocketClientRtpAudioStream(
 
     fun connectStreamSocket(room: Room) {
         if (keepAliveJob == null) startKeepAlive()
-        initPlayer(room)
+        initMultiChannelPlayer()
         initRecorder(room)
     }
 
-    private fun initPlayer(room: Room) {
-        if (streamPlayer == null) {
+    private fun initMultiChannelPlayer() {
+        if (multiChannelPlayer == null) {
             coroutineScope.launch {
-                streamPlayer = StreamPlayer3(sharedSocket, InetAddress.getByName(ipAddress), port, room.speakerType).apply {
-                    listener = object : StreamPlayer3.StreamPlayerListener {
-                        override fun onStreamStart() {
+                multiChannelPlayer = MultiChannelAudioPlayer(sharedSocket, InetAddress.getByName(ipAddress), port).apply {
+                    listener = object : MultiChannelAudioPlayer.MultiChannelAudioListener {
+                        override fun onChannelStarted(channelId: String) {
+                            Log.d("MultiChannel", "Channel started: $channelId")
                         }
 
-                        override fun onStreamStop() {
+                        override fun onChannelStopped(channelId: String) {
+                            Log.d("MultiChannel", "Channel stopped: $channelId")
                         }
 
                         override fun onLog(message: String) {
+                            Log.d("MultiChannel", message)
                         }
 
                         override fun onError(error: String) {
+                            Log.e("MultiChannel", error)
                         }
                     }
                 }
-                streamPlayer?.apply {
-                    speakerType = room.speakerType
-                    setVolume(room.roomID ?: "", room.volume)
-                    startPlaying()
-                }
-            }
-        } else {
-            streamPlayer?.apply {
-                speakerType = room.speakerType
-                setVolume(room.roomID ?: "", room.volume)
+                multiChannelPlayer?.start()
             }
         }
     }
@@ -242,6 +244,14 @@ class WebSocketClientRtpAudioStream(
     }
 
     fun isRecording(): Boolean = streamRecorder?.keepRecording ?: false
+    
+    fun setChannelVolume(channelId: String, volume: Float) {
+        multiChannelPlayer?.setChannelVolume(channelId, volume)
+    }
+    
+    fun getChannelStats(channelId: String): Map<String, Any>? {
+        return multiChannelPlayer?.getChannelStats(channelId)
+    }
 
     // ------------------- Keep Alive -------------------
 
@@ -336,3 +346,4 @@ class WebSocketClientRtpAudioStream(
         fun onClose()
     }
 }
+
