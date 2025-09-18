@@ -1,209 +1,402 @@
 package com.home.audiostreaming
 
 import android.media.*
-import android.os.Process
+import android.os.SystemClock
+import android.util.Base64
 import android.util.Log
-import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import com.example.opuslib.utils.OpusDecoder
+import org.json.JSONObject
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import javax.crypto.Cipher
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /**
- * MultiChannelAudioPlayer handles mixing and playback of multiple audio channels
- * using a single AudioTrack in streaming mode. This class uses Kotlin coroutines
- * for efficient audio processing and mixing.
+ * Multi-Channel Audio Player implementing smooth, synchronized audio playback
+ * across multiple channels with proper jitter buffer management and timing synchronization.
  */
-class MultiChannelAudioPlayer {
+class MultiChannelAudioPlayer(
+    private val socket: DatagramSocket,
+    private val address: InetAddress,
+    private val port: Int
+) {
     
-    companion object {
-        private const val TAG = "MultiChannelAudioPlayer"
-        private const val SAMPLE_RATE = 48000
-        private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_OUT_STEREO
-        private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
-        private const val BUFFER_SIZE_MULTIPLIER = 4
-        private const val MIXING_INTERVAL_MS = 20L // Mix every 20ms for smooth playback
-        private const val FRAME_SIZE_SAMPLES = (SAMPLE_RATE * MIXING_INTERVAL_MS / 1000).toInt()
-        private const val MAX_CHANNELS = 4
+    interface MultiChannelAudioListener {
+        fun onChannelStarted(channelId: String)
+        fun onChannelStopped(channelId: String)
+        fun onLog(message: String)
+        fun onError(error: String)
     }
     
-    // Audio components
-    private var audioTrack: AudioTrack? = null
-    private val audioMixer = AudioMixer()
-    private val bufferManager = AudioBufferManager()
-    
-    // Coroutine management
-    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var mixerJob: Job? = null
-    private var isPlaying = AtomicBoolean(false)
+    // Audio configuration
+    private val SAMPLE_RATE = AudioStreamConstant.SAMPLE_RATE
+    private val CHANNELS = 1 // Mono input
+    private val BITS_PER_SAMPLE = 16
+    private val FRAME_DURATION_MS = 40L
+    private val JITTER_BUFFER_SIZE = 10 // Maximum frames to buffer per channel
+    private val PROCESSING_INTERVAL_MS = 10L // 10ms processing interval
     
     // Channel management
-    private val channelVolumes = ConcurrentHashMap<String, Float>()
-    private val channelStates = ConcurrentHashMap<String, ChannelState>()
+    private val activeChannels = ConcurrentHashMap<String, ChannelData>()
+    private val jitterBuffers = ConcurrentHashMap<String, ConcurrentLinkedQueue<AudioFrame>>()
+    private val opusDecoders = ConcurrentHashMap<String, OpusDecoder>()
+    private val audioTracks = ConcurrentHashMap<String, AudioTrack>()
     
-    // State management
-    private val _playbackState = MutableStateFlow(PlaybackState.STOPPED)
-    val playbackState: StateFlow<PlaybackState> = _playbackState.asStateFlow()
+    // Timing and synchronization
+    private val globalReferenceTime = SystemClock.elapsedRealtimeNanos()
+    private val channelTimestamps = ConcurrentHashMap<String, Long>()
+    private val lastProcessedTime = AtomicLong(0L)
     
-    // Audio data channel for mixing
-    private val audioDataChannel = Channel<AudioData>(Channel.UNLIMITED)
+    // Threading
+    private val isPlaying = AtomicBoolean(false)
+    private var packetReceiverThread: Thread? = null
+    private var audioProcessorThread: Thread? = null
     
-    // Listener interface
-    interface AudioPlayerListener {
-        fun onPlaybackStarted()
-        fun onPlaybackStopped()
-        fun onError(error: String)
-        fun onChannelStateChanged(channelId: String, isActive: Boolean)
-    }
-    
-    private var listener: AudioPlayerListener? = null
+    var listener: MultiChannelAudioListener? = null
     
     /**
-     * Initializes the audio system and starts playback.
+     * Channel data structure for managing per-channel state
      */
-    fun startPlayback() {
-        if (isPlaying.get()) {
-            Log.w(TAG, "Playback already started")
-            return
-        }
+    data class ChannelData(
+        val channelId: String,
+        var volume: Float = 1.0f,
+        var isActive: Boolean = false,
+        var lastPacketTime: Long = 0L,
+        var packetsReceived: Long = 0L,
+        var packetsDropped: Long = 0L
+    )
+    
+    /**
+     * Audio frame with timing information
+     */
+    data class AudioFrame(
+        val pcmData: ShortArray,
+        val timestamp: Long,
+        val sequenceNumber: Long,
+        val channelId: String
+    )
+    
+    /**
+     * Start the multi-channel audio player
+     */
+    fun start() {
+        if (isPlaying.get()) return
         
-        try {
-            initializeAudioTrack()
-            startMixingCoroutine()
-            isPlaying.set(true)
-            _playbackState.value = PlaybackState.PLAYING
-            listener?.onPlaybackStarted()
-            Log.d(TAG, "Audio playback started")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start playback", e)
-            listener?.onError("Failed to start playback: ${e.message}")
-        }
+        isPlaying.set(true)
+        startPacketReceiver()
+        startUnifiedAudioProcessor()
+        listener?.onLog("Multi-channel audio player started")
     }
     
     /**
-     * Stops audio playback and releases resources.
+     * Stop the multi-channel audio player
      */
-    fun stopPlayback() {
-        if (!isPlaying.get()) {
-            Log.w(TAG, "Playback not started")
-            return
-        }
-        
+    fun stop() {
         isPlaying.set(false)
-        _playbackState.value = PlaybackState.STOPPED
+        packetReceiverThread?.interrupt()
+        audioProcessorThread?.interrupt()
         
-        // Cancel mixing coroutine
-        mixerJob?.cancel()
-        mixerJob = null
-        
-        // Stop and release AudioTrack
-        audioTrack?.let { track ->
-            if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+        // Stop all audio tracks
+        audioTracks.values.forEach { track ->
+            try {
                 track.stop()
+                track.release()
+            } catch (e: Exception) {
+                Log.e("MultiChannelAudio", "Error stopping audio track: ${e.message}")
             }
-            track.release()
         }
-        audioTrack = null
         
-        // Clear all buffers
-        bufferManager.clearAllChannels()
+        // Clear all data structures
+        audioTracks.clear()
+        jitterBuffers.clear()
+        opusDecoders.clear()
+        activeChannels.clear()
+        channelTimestamps.clear()
         
-        listener?.onPlaybackStopped()
-        Log.d(TAG, "Audio playback stopped")
+        listener?.onLog("Multi-channel audio player stopped")
     }
     
     /**
-     * Adds audio data from a WebSocket channel to the mixing system.
-     * 
-     * @param channelId Channel identifier
-     * @param pcmData Raw PCM audio data
-     * @param timestamp Timestamp when the data was received
-     */
-    fun addAudioData(channelId: String, pcmData: ShortArray, timestamp: Long) {
-        if (!isPlaying.get()) {
-            Log.w(TAG, "Cannot add audio data: playback not started")
-            return
-        }
-        
-        bufferManager.addAudioData(channelId, pcmData, timestamp)
-        
-        // Update channel state
-        val wasActive = channelStates[channelId]?.isActive ?: false
-        val isActive = bufferManager.hasData(channelId)
-        
-        if (wasActive != isActive) {
-            channelStates[channelId] = ChannelState(isActive, System.currentTimeMillis())
-            listener?.onChannelStateChanged(channelId, isActive)
-        }
-    }
-    
-    /**
-     * Sets the volume for a specific channel.
-     * 
-     * @param channelId Channel identifier
-     * @param volume Volume level (0.0f to 1.0f)
+     * Set volume for a specific channel
      */
     fun setChannelVolume(channelId: String, volume: Float) {
-        val clampedVolume = volume.coerceIn(0.0f, 1.0f)
-        channelVolumes[channelId] = clampedVolume
-        Log.d(TAG, "Set volume for channel $channelId to $clampedVolume")
+        activeChannels[channelId]?.volume = volume.coerceIn(0f, 1f)
+        audioTracks[channelId]?.setVolume(volume.coerceIn(0f, 1f))
     }
     
-    /**
-     * Gets the current volume for a specific channel.
-     * 
-     * @param channelId Channel identifier
-     * @return Current volume level
-     */
-    fun getChannelVolume(channelId: String): Float {
-        return channelVolumes[channelId] ?: 1.0f
-    }
+     /**
+      * Add or activate a channel
+      */
+     fun addChannel(channelId: String, volume: Float = 1.0f) {
+         if (activeChannels.containsKey(channelId)) {
+             Log.w("MultiChannelAudio", "⚠️  Channel $channelId already exists")
+             return
+         }
+         
+         Log.i("MultiChannelAudio", "➕ Adding channel -> ID: $channelId, Volume: ${(volume * 100).toInt()}%")
+         
+         val channelData = ChannelData(channelId, volume, true)
+         activeChannels[channelId] = channelData
+         jitterBuffers[channelId] = ConcurrentLinkedQueue()
+         
+         // Initialize Opus decoder for this channel
+         opusDecoders[channelId] = OpusDecoder().apply {
+             init(SAMPLE_RATE, CHANNELS, 4800)
+         }
+         
+         // Initialize AudioTrack for this channel
+         createAudioTrackForChannel(channelId)
+         
+         Log.i("MultiChannelAudio", "✅ Channel $channelId added and activated successfully")
+         listener?.onChannelStarted(channelId)
+         listener?.onLog("Channel $channelId added and activated")
+     }
     
     /**
-     * Removes a channel from the mixing system.
-     * 
-     * @param channelId Channel identifier
+     * Remove or deactivate a channel
      */
     fun removeChannel(channelId: String) {
-        bufferManager.removeChannel(channelId)
-        channelVolumes.remove(channelId)
-        channelStates.remove(channelId)
-        Log.d(TAG, "Removed channel $channelId")
+        activeChannels[channelId]?.isActive = false
+        
+        // Stop and release AudioTrack
+        audioTracks[channelId]?.let { track ->
+            try {
+                track.stop()
+                track.release()
+            } catch (e: Exception) {
+                Log.e("MultiChannelAudio", "Error releasing audio track for channel $channelId: ${e.message}")
+            }
+        }
+        
+        // Clean up resources
+        audioTracks.remove(channelId)
+        jitterBuffers.remove(channelId)
+        opusDecoders.remove(channelId)
+        activeChannels.remove(channelId)
+        channelTimestamps.remove(channelId)
+        
+        listener?.onChannelStopped(channelId)
+        listener?.onLog("Channel $channelId removed")
     }
     
     /**
-     * Gets statistics for all channels.
-     * 
-     * @return Map of channel statistics
+     * Step 1: Packet Reception - UDP packet receiver thread
      */
-    fun getChannelStatistics(): Map<String, AudioBufferManager.ChannelStats> {
-        return bufferManager.getAllChannelStats()
+    private fun startPacketReceiver() {
+        packetReceiverThread = Thread {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+            
+            val buffer = ByteArray(8192)
+            val keyAES = SecretKeySpec(Base64.decode(AudioStreamConstant.AES_256_ALGO_KEY, Base64.DEFAULT), "AES")
+            
+            try {
+                while (isPlaying.get() && !Thread.currentThread().isInterrupted) {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    socket.receive(packet)
+                    processIncomingPacket(packet, keyAES)
+                }
+            } catch (e: Exception) {
+                if (isPlaying.get()) {
+                    listener?.onError("Packet receiver error: ${e.message}")
+                    Log.e("MultiChannelAudio", "Packet receiver error", e)
+                }
+            }
+        }.apply { start() }
+    }
+    
+     /**
+      * Step 2: Channel Routing - Process incoming packets and route to channels
+      */
+     private fun processIncomingPacket(packet: DatagramPacket, keyAES: SecretKeySpec) {
+         try {
+             val rawJson = String(packet.data, 0, packet.length, Charsets.UTF_8)
+             val jsonObj = JSONObject(rawJson)
+             
+             // Log all incoming packets for debugging
+             Log.d("MultiChannelAudio", "📦 RX UDP Packet -> Size: ${packet.length} bytes, From: ${packet.address}:${packet.port}")
+             Log.d("MultiChannelAudio", "📋 Packet JSON: $rawJson")
+             
+             if (jsonObj.has("type") && jsonObj.optString("type") == "audio") {
+                 val channelId = jsonObj.optString("channel_id")
+                 val base64Data = jsonObj.optString("data")
+                 
+                 Log.i("MultiChannelAudio", "🎵 AUDIO PACKET -> Channel: $channelId, DataSize: ${base64Data.length} chars")
+                 
+                 // Check if channel is active
+                 val channelData = activeChannels[channelId]
+                 if (channelData?.isActive != true) {
+                     Log.w("MultiChannelAudio", "⚠️  Channel $channelId not active, dropping packet")
+                     return
+                 }
+                 
+                 // Step 3: Opus Decoding
+                 if (base64Data.isNotEmpty()) {
+                     val encryptedData = Base64.decode(base64Data, Base64.DEFAULT)
+                     val decryptedData = decryptAES(encryptedData, keyAES)
+                     val pcmData = decodeOpus(channelId, decryptedData)
+                     
+                     Log.d("MultiChannelAudio", "🔓 Decoded -> Encrypted: ${encryptedData.size} bytes, Decrypted: ${decryptedData.size} bytes, PCM: ${pcmData.size} samples")
+                     
+                     if (pcmData.isNotEmpty()) {
+                         // Step 4: Jitter Buffer Management
+                         val frame = AudioFrame(
+                             pcmData = pcmData,
+                             timestamp = SystemClock.elapsedRealtimeNanos(),
+                             sequenceNumber = channelData.packetsReceived,
+                             channelId = channelId
+                         )
+                         
+                         val jitterBuffer = jitterBuffers[channelId] ?: return
+                         
+                         // Add frame to jitter buffer
+                         jitterBuffer.offer(frame)
+                         
+                         // Manage buffer size to prevent memory issues
+                         while (jitterBuffer.size > JITTER_BUFFER_SIZE) {
+                             jitterBuffer.poll() // Remove oldest frame
+                             channelData.packetsDropped++
+                             Log.w("MultiChannelAudio", "🗑️  Dropped frame for channel $channelId (buffer full)")
+                         }
+                         
+                         channelData.packetsReceived++
+                         channelData.lastPacketTime = System.currentTimeMillis()
+                         
+                         Log.v("MultiChannelAudio", "✅ Audio processed -> Channel: $channelId, Packets: ${channelData.packetsReceived}, Buffer: ${jitterBuffer.size}, Dropped: ${channelData.packetsDropped}")
+                     } else {
+                         Log.w("MultiChannelAudio", "⚠️  Empty PCM data for channel $channelId")
+                     }
+                 } else {
+                     Log.w("MultiChannelAudio", "⚠️  Empty audio data for channel $channelId")
+                 }
+             } else {
+                 Log.d("MultiChannelAudio", "📄 Non-audio packet: ${jsonObj.optString("type", "unknown")}")
+             }
+         } catch (e: Exception) {
+             Log.e("MultiChannelAudio", "❌ Packet processing error: ${e.message}", e)
+         }
+     }
+    
+    /**
+     * Step 5: Unified Audio Processing - Single high-priority thread for all channels
+     */
+    private fun startUnifiedAudioProcessor() {
+        audioProcessorThread = Thread {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+            
+            try {
+                while (isPlaying.get() && !Thread.currentThread().isInterrupted) {
+                    val currentTime = SystemClock.elapsedRealtimeNanos()
+                    
+                    // Process all active channels
+                    for (channelId in activeChannels.keys) {
+                        val channelData = activeChannels[channelId]
+                        if (channelData?.isActive == true) {
+                            processChannelAudio(channelId, currentTime)
+                        }
+                    }
+                    
+                    // Sleep for processing interval
+                    Thread.sleep(PROCESSING_INTERVAL_MS)
+                }
+            } catch (e: InterruptedException) {
+                // Thread was interrupted, this is expected when stopping
+            } catch (e: Exception) {
+                if (isPlaying.get()) {
+                    listener?.onError("Audio processor error: ${e.message}")
+                    Log.e("MultiChannelAudio", "Audio processor error", e)
+                }
+            }
+        }.apply { start() }
+    }
+    
+     /**
+      * Step 6: Per-Channel Playback - Process audio for a specific channel
+      */
+     private fun processChannelAudio(channelId: String, currentTime: Long) {
+         val jitterBuffer = jitterBuffers[channelId] ?: return
+         val audioTrack = audioTracks[channelId] ?: return
+         val channelData = activeChannels[channelId] ?: return
+         
+         if (jitterBuffer.isEmpty()) return
+         
+         // Get the next frame from jitter buffer
+         val frame = jitterBuffer.poll() ?: return
+         
+         Log.v("MultiChannelAudio", "🔊 Playing audio -> Channel: $channelId, Frame: ${frame.sequenceNumber}, PCM: ${frame.pcmData.size} samples")
+         
+         // Ensure AudioTrack is playing
+         if (audioTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
+             audioTrack.play()
+             Log.d("MultiChannelAudio", "▶️  Started AudioTrack for channel $channelId")
+         }
+         
+         // Step 7: Timing Synchronization
+         val synchronizedTimestamp = getSynchronizedTimestamp(audioTrack, currentTime)
+         
+         // Convert mono to stereo
+         val stereoData = convertMonoToStereo(frame.pcmData)
+         
+         // Write audio data with precise timing
+         try {
+             val byteBuffer = ByteBuffer.allocateDirect(stereoData.size * 2)
+             byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
+             byteBuffer.asShortBuffer().put(stereoData)
+             byteBuffer.position(0)
+             
+             val bytesWritten = audioTrack.write(
+                 byteBuffer, 
+                 stereoData.size * 2, 
+                 AudioTrack.WRITE_BLOCKING, 
+                 synchronizedTimestamp
+             )
+             
+             if (bytesWritten > 0) {
+                 // Update channel timestamp for synchronization
+                 channelTimestamps[channelId] = currentTime
+                 Log.v("MultiChannelAudio", "✅ Audio written -> Channel: $channelId, Bytes: $bytesWritten, Buffer: ${jitterBuffer.size}")
+             } else {
+                 Log.w("MultiChannelAudio", "⚠️  Failed to write audio for channel $channelId")
+             }
+         } catch (e: Exception) {
+             Log.e("MultiChannelAudio", "❌ Error writing audio for channel $channelId: ${e.message}")
+         }
+     }
+    
+    /**
+     * Step 7: Timing Synchronization - Get synchronized timestamp for all channels
+     */
+    private fun getSynchronizedTimestamp(audioTrack: AudioTrack, currentTime: Long): Long {
+        val timestamp = AudioTimestamp()
+        
+        return if (audioTrack.getTimestamp(timestamp)) {
+            // Use AudioTrack's timestamp for precise synchronization
+            timestamp.nanoTime + (FRAME_DURATION_MS * 1_000_000)
+        } else {
+            // Fallback to system time with global reference
+            currentTime + (FRAME_DURATION_MS * 1_000_000)
+        }
     }
     
     /**
-     * Sets the audio player listener.
-     * 
-     * @param listener AudioPlayerListener instance
+     * Create AudioTrack for a specific channel
      */
-    fun setListener(listener: AudioPlayerListener?) {
-        this.listener = listener
-    }
-    
-    /**
-     * Initializes the AudioTrack with proper configuration.
-     */
-    private fun initializeAudioTrack() {
+    private fun createAudioTrackForChannel(channelId: String) {
         val minBufferSize = AudioTrack.getMinBufferSize(
             SAMPLE_RATE,
-            CHANNEL_CONFIG,
-            AUDIO_FORMAT
-        )
+            AudioFormat.CHANNEL_OUT_STEREO,
+            AudioFormat.ENCODING_PCM_16BIT
+        ) * 4 // 4x minimum for smooth playback
         
-        val bufferSize = minBufferSize * BUFFER_SIZE_MULTIPLIER
-        
-        audioTrack = AudioTrack.Builder()
+        val audioTrack = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -213,36 +406,6 @@ class MultiChannelAudioPlayer {
             .setAudioFormat(
                 AudioFormat.Builder()
                     .setSampleRate(SAMPLE_RATE)
-<<<<<<< HEAD
-                    .setEncoding(AUDIO_FORMAT)
-                    .setChannelMask(CHANNEL_CONFIG)
-                    .build()
-            )
-            .setBufferSizeInBytes(bufferSize)
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
-        
-        audioTrack?.play()
-        Log.d(TAG, "AudioTrack initialized with buffer size: $bufferSize")
-    }
-    
-    /**
-     * Starts the mixing coroutine that continuously mixes audio from all channels.
-     */
-    private fun startMixingCoroutine() {
-        mixerJob = coroutineScope.launch {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
-            
-            while (isActive && isPlaying.get()) {
-                try {
-                    mixAndPlayAudio()
-                    delay(MIXING_INTERVAL_MS)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error in mixing coroutine", e)
-                    listener?.onError("Mixing error: ${e.message}")
-                }
-            }
-=======
                     .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                     .build()
@@ -278,89 +441,11 @@ class MultiChannelAudioPlayer {
         } catch (e: Exception) {
             Log.e("MultiChannelAudio", "Decryption error: ${e.message}")
             ByteArray(0)
->>>>>>> 6587381 (update: logic to play through multi-channel)
         }
     }
     
     /**
-<<<<<<< HEAD
-     * Mixes audio from all active channels and plays the result.
-     */
-    private suspend fun mixAndPlayAudio() {
-        val activeChannels = bufferManager.getActiveChannels()
-        if (activeChannels.isEmpty()) {
-            // No active channels, play silence
-            playSilence()
-            return
-        }
-        
-        // Prepare channel data for mixing
-        val channelData = Array<ShortArray?>(MAX_CHANNELS) { null }
-        val volumes = FloatArray(MAX_CHANNELS) { 1.0f }
-        
-        var channelIndex = 0
-        for (channelId in activeChannels) {
-            if (channelIndex >= MAX_CHANNELS) break
-            
-            val frame = bufferManager.getNextFrame(channelId)
-            if (frame != null) {
-                channelData[channelIndex] = frame.pcmData
-                volumes[channelIndex] = getChannelVolume(channelId)
-            }
-            channelIndex++
-        }
-        
-        // Mix the audio channels
-        val mixedAudio = audioMixer.mixChannelsAdvanced(
-            channelData,
-            FRAME_SIZE_SAMPLES,
-            volumes
-        )
-        
-        // Convert mono to stereo for playback
-        val stereoAudio = convertMonoToStereo(mixedAudio)
-        
-        // Play the mixed audio
-        playAudioData(stereoAudio)
-    }
-    
-    /**
-     * Plays silence when no channels are active.
-     */
-    private suspend fun playSilence() {
-        val silence = audioMixer.createSilence(FRAME_SIZE_SAMPLES)
-        val stereoSilence = convertMonoToStereo(silence)
-        playAudioData(stereoSilence)
-    }
-    
-    /**
-     * Plays audio data through the AudioTrack.
-     * 
-     * @param audioData Audio data to play
-     */
-    private fun playAudioData(audioData: ShortArray) {
-        val track = audioTrack ?: return
-        
-        if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
-            track.play()
-        }
-        
-        val byteBuffer = audioData.toByteArray()
-        val bytesWritten = track.write(byteBuffer, 0, byteBuffer.size, AudioTrack.WRITE_BLOCKING)
-        
-        if (bytesWritten < 0) {
-            Log.e(TAG, "Failed to write audio data: $bytesWritten")
-        }
-    }
-    
-    /**
-     * Converts mono audio to stereo by duplicating the channel.
-     * 
-     * @param monoData Mono audio data
-     * @return Stereo audio data
-=======
      * Convert mono PCM data to stereo
->>>>>>> 6587381 (update: logic to play through multi-channel)
      */
     private fun convertMonoToStereo(monoData: ShortArray): ShortArray {
         val stereoData = ShortArray(monoData.size * 2)
@@ -372,56 +457,6 @@ class MultiChannelAudioPlayer {
     }
     
     /**
-<<<<<<< HEAD
-     * Converts ShortArray to ByteArray for AudioTrack.
-     * 
-     * @param shortArray ShortArray to convert
-     * @return ByteArray representation
-     */
-    private fun ShortArray.toByteArray(): ByteArray {
-        val byteArray = ByteArray(this.size * 2)
-        for (i in this.indices) {
-            val sample = this[i]
-            byteArray[i * 2] = (sample.toInt() and 0xFF).toByte()
-            byteArray[i * 2 + 1] = ((sample.toInt() shr 8) and 0xFF).toByte()
-        }
-        return byteArray
-    }
-    
-    /**
-     * Enum representing the playback state.
-     */
-    enum class PlaybackState {
-        STOPPED,
-        PLAYING,
-        PAUSED
-    }
-    
-    /**
-     * Data class representing the state of a channel.
-     */
-    data class ChannelState(
-        val isActive: Boolean,
-        val lastUpdateTime: Long
-    )
-    
-    /**
-     * Data class representing audio data for mixing.
-     */
-    data class AudioData(
-        val channelId: String,
-        val pcmData: ShortArray,
-        val timestamp: Long
-    )
-    
-    /**
-     * Cleanup method to release resources.
-     */
-    fun cleanup() {
-        stopPlayback()
-        coroutineScope.cancel()
-    }
-=======
      * Get channel statistics
      */
     fun getChannelStats(channelId: String): Map<String, Any>? {
@@ -440,5 +475,4 @@ class MultiChannelAudioPlayer {
      * Get all active channel IDs
      */
     fun getActiveChannels(): Set<String> = activeChannels.keys.toSet()
->>>>>>> 6587381 (update: logic to play through multi-channel)
 }
