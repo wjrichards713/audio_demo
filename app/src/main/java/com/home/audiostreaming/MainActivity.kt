@@ -15,6 +15,7 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -284,6 +285,46 @@ class MainActivity : AppCompatActivity() {
                 holder.binding.btnStartAudio.text = "Start Audio"
                 holder.binding.btnRemove.isVisible = true
             }
+
+            // --- Volume slider ---
+            holder.binding.seekBarVolume.progress = (channel.volume * 100).toInt()
+            holder.binding.seekBarVolume.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (fromUser) {
+                        channel.volume = progress / 100f
+                        webSocketManager?.setSpeakerVolume(channel)
+                    }
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+            })
+
+            // --- Speaker select buttons ---
+            fun updateSpeakerButtons(type: String) {
+                val activeColor = Color.parseColor("#4CAF50")
+                val inactiveColor = Color.parseColor("#BDBDBD")
+                holder.binding.btnSpeakerLeft.backgroundTintList = ColorStateList.valueOf(if (type == "left") activeColor else inactiveColor)
+                holder.binding.btnSpeakerCenter.backgroundTintList = ColorStateList.valueOf(if (type == "center") activeColor else inactiveColor)
+                holder.binding.btnSpeakerRight.backgroundTintList = ColorStateList.valueOf(if (type == "right") activeColor else inactiveColor)
+            }
+            updateSpeakerButtons(channel.speakerType)
+
+            holder.binding.btnSpeakerLeft.setOnClickListener {
+                channel.speakerType = "left"
+                updateSpeakerButtons("left")
+                webSocketManager?.setSpeakerType(channel)
+            }
+            holder.binding.btnSpeakerCenter.setOnClickListener {
+                channel.speakerType = "center"
+                updateSpeakerButtons("center")
+                webSocketManager?.setSpeakerType(channel)
+            }
+            holder.binding.btnSpeakerRight.setOnClickListener {
+                channel.speakerType = "right"
+                updateSpeakerButtons("right")
+                webSocketManager?.setSpeakerType(channel)
+            }
+
             holder.binding.btnRemove.setOnClickListener {
                 if (channel.isJoined){
                     webSocketManager!!.sendDisconnect(channel)

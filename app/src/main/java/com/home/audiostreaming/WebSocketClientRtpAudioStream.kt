@@ -75,6 +75,14 @@ class WebSocketClientRtpAudioStream(
     fun removeRoom(room: Room){
         rooms.remove(room)
     }
+
+    fun setSpeakerVolume(room: Room) {
+        streamPlayer?.setVolume(room.roomID ?: "", room.volume)
+    }
+
+    fun setSpeakerType(room: Room) {
+        streamPlayer?.setSpeakerType(room.roomID ?: "", room.speakerType)
+    }
     // ------------------- Public APIs -------------------
 
     fun connectWebSocket() {

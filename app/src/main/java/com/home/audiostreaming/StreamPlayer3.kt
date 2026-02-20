@@ -24,8 +24,10 @@ class StreamPlayer3(
 
     companion object {
         private const val TAG = "SP3"
-        private const val OPUS_MAX_FRAME_SIZE = 4800   // 100ms at 48kHz mono (confirmed from logs)
-        private const val JITTER_BUFFER_MIN_FRAMES = 3 // Wait for this many before starting playback
+        private const val OPUS_MAX_FRAME_SIZE = 4800   // 100ms at 48kHz mono (for Opus decoder)
+        private const val MIXER_FRAME_SIZE = 1920      // 40ms at 48kHz — fixed output per mix cycle
+        private const val JITTER_BUFFER_MIN_FRAMES = 5 // Wait for this many before starting playback
+        private const val FADE_SAMPLES = 64            // Crossfade length (~1.3ms at 48kHz)
         private const val CHANNEL_IDLE_TIMEOUT_MS = 500L
         private const val MAX_QUEUE_SIZE = 20
     }
@@ -43,6 +45,7 @@ class StreamPlayer3(
     private val jitterBuffers = ConcurrentHashMap<String, ConcurrentLinkedQueue<PcmFrame>>()
     private val opusDecoders = ConcurrentHashMap<String, OpusDecoder>()
     private val channelVolumes = ConcurrentHashMap<String, Float>()
+    private val channelSpeakerTypes = ConcurrentHashMap<String, String>()
     private val channelLastReceiveTime = ConcurrentHashMap<String, Long>()
     private val channelPlaying = ConcurrentHashMap<String, Boolean>()
 
@@ -63,6 +66,11 @@ class StreamPlayer3(
     fun setVolume(channelID: String, volume: Float) {
         channelVolumes[channelID] = volume.coerceIn(0f, 1.0f)
         Log.d(TAG, "setVolume channel=$channelID volume=$volume")
+    }
+
+    fun setSpeakerType(channelID: String, type: String) {
+        channelSpeakerTypes[channelID] = type
+        Log.d(TAG, "setSpeakerType channel=$channelID type=$type")
     }
 
     fun startPlaying() {
@@ -140,6 +148,7 @@ class StreamPlayer3(
         channelPlaying.clear()
         channelLastReceiveTime.clear()
         channelVolumes.clear()
+        channelSpeakerTypes.clear()
 
         listener?.onStreamStop()
     }
@@ -191,16 +200,26 @@ class StreamPlayer3(
     // =========================================================================
 
     private fun runMixerLoop() {
-        // Stereo output: max 4800 mono samples -> 9600 stereo shorts
-        val maxStereo = OPUS_MAX_FRAME_SIZE * 2
-        val mixBuffer = IntArray(maxStereo)       // int accumulator to avoid clipping during sum
-        val outputShorts = ShortArray(maxStereo)   // final 16-bit output
+        // Fixed stereo output: MIXER_FRAME_SIZE mono samples -> MIXER_FRAME_SIZE*2 stereo shorts
+        val stereoSamples = MIXER_FRAME_SIZE * 2
+        val mixBuffer = IntArray(stereoSamples)       // int accumulator to avoid clipping during sum
+        val outputShorts = ShortArray(stereoSamples)   // final 16-bit output
+
+        // Per-channel remainder buffer for frames larger than MIXER_FRAME_SIZE
+        // (e.g. iOS sends 4800-sample frames, we consume 1920 per cycle).
+        // Accessed only from this thread — plain HashMap is fine.
+        val remainders = HashMap<String, ShortArray>()
+
+        // Per-channel crossfade state: prevents clicks when a channel briefly
+        // has no data (queue empty). Tracks whether channel had data in the
+        // previous cycle and the last sample value for smooth fade-out/fade-in.
+        val channelHadData = HashMap<String, Boolean>()
+        val channelLastSample = HashMap<String, Int>()
+        var underflowCount = 0L
 
         while (keepPlaying) {
             mixBuffer.fill(0)
             var activeChannels = 0
-            var frameSamples = 0  // actual mono samples this cycle (from decoded frames)
-            val now = System.currentTimeMillis()
 
             for (channelID in jitterBuffers.keys.toList()) {
                 val queue = jitterBuffers[channelID] ?: continue
@@ -217,38 +236,125 @@ class StreamPlayer3(
                     }
                 }
 
-                // No frame available — skip this channel (silence), don't re-gate
-                val frame = queue.poll() ?: continue
-
                 val volume = channelVolumes[channelID] ?: 1.0f
-                val samplesToMix = frame.pcmData.size
-                frameSamples = maxOf(frameSamples, samplesToMix)
+                val spkType = channelSpeakerTypes[channelID] ?: "center"
+                val hadData = channelHadData[channelID] ?: false
+                val needFadeIn = !hadData  // first data after a gap — ramp in
+                var offset = 0
+                var lastMixedSample = 0
 
-                // Sum mono PCM into stereo int accumulator
-                for (i in 0 until samplesToMix) {
-                    val sample = (frame.pcmData[i] * volume).toInt()
-                    mixBuffer[i * 2] += sample       // Left
-                    mixBuffer[i * 2 + 1] += sample   // Right
+                // 1. Mix any leftover samples from the previous cycle's partial frame
+                val rem = remainders.remove(channelID)
+                if (rem != null) {
+                    val usable = minOf(rem.size, MIXER_FRAME_SIZE)
+                    for (i in 0 until usable) {
+                        var sample = (rem[i] * volume).toInt()
+                        if (needFadeIn && (offset + i) < FADE_SAMPLES) {
+                            sample = sample * (offset + i) / FADE_SAMPLES
+                        }
+                        lastMixedSample = sample
+                        when (spkType) {
+                            "left"  -> mixBuffer[(offset + i) * 2] += sample
+                            "right" -> mixBuffer[(offset + i) * 2 + 1] += sample
+                            else -> {
+                                mixBuffer[(offset + i) * 2] += sample
+                                mixBuffer[(offset + i) * 2 + 1] += sample
+                            }
+                        }
+                    }
+                    offset += usable
+                    if (usable < rem.size) {
+                        remainders[channelID] = rem.copyOfRange(usable, rem.size)
+                    }
                 }
-                activeChannels++
+
+                // 2. Poll frames until we reach MIXER_FRAME_SIZE (1920) samples — NOT 4800.
+                //    This ensures consistent 40ms output and prevents greedy consumption
+                //    that would drain queues and cause intermittent channel dropouts.
+                while (offset < MIXER_FRAME_SIZE) {
+                    val frame = queue.poll() ?: break
+                    val available = frame.pcmData.size
+                    val usable = minOf(available, MIXER_FRAME_SIZE - offset)
+
+                    for (i in 0 until usable) {
+                        var sample = (frame.pcmData[i] * volume).toInt()
+                        if (needFadeIn && (offset + i) < FADE_SAMPLES) {
+                            sample = sample * (offset + i) / FADE_SAMPLES
+                        }
+                        lastMixedSample = sample
+                        when (spkType) {
+                            "left"  -> mixBuffer[(offset + i) * 2] += sample
+                            "right" -> mixBuffer[(offset + i) * 2 + 1] += sample
+                            else -> {
+                                mixBuffer[(offset + i) * 2] += sample
+                                mixBuffer[(offset + i) * 2 + 1] += sample
+                            }
+                        }
+                    }
+                    offset += usable
+
+                    // Save unused tail of the frame for the next cycle
+                    if (usable < available) {
+                        remainders[channelID] = frame.pcmData.copyOfRange(usable, available)
+                    }
+                }
+
+                if (offset > 0) {
+                    // Channel produced audio — save state for crossfade
+                    channelHadData[channelID] = true
+                    channelLastSample[channelID] = lastMixedSample
+                    activeChannels++
+                } else if (hadData) {
+                    // Channel just went empty — generate fade-out to prevent click
+                    val lastSample = channelLastSample[channelID] ?: 0
+                    if (lastSample != 0) {
+                        for (i in 0 until FADE_SAMPLES) {
+                            val fade = lastSample * (FADE_SAMPLES - 1 - i) / FADE_SAMPLES
+                            when (spkType) {
+                                "left"  -> mixBuffer[i * 2] += fade
+                                "right" -> mixBuffer[i * 2 + 1] += fade
+                                else -> {
+                                    mixBuffer[i * 2] += fade
+                                    mixBuffer[i * 2 + 1] += fade
+                                }
+                            }
+                        }
+                        activeChannels++  // count as active during fade-out
+                    }
+                    underflowCount++
+                    Log.w(TAG, "UNDERFLOW ch=$channelID #$underflowCount lastSample=$lastSample")
+                    channelHadData[channelID] = false
+                    channelLastSample[channelID] = 0
+                }
             }
 
-            if (frameSamples == 0) {
+            if (activeChannels == 0) {
                 // No audio data from any channel — brief sleep to avoid busy loop
                 try { Thread.sleep(5) } catch (_: InterruptedException) { break }
                 continue
             }
 
-            // Clamp int accumulator to 16-bit range
-            val stereoSamples = frameSamples * 2
+            // Peak limiter: find max absolute value, normalize if it would clip
+            var peak = 0
             for (i in 0 until stereoSamples) {
-                outputShorts[i] = mixBuffer[i].coerceIn(
-                    Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()
-                ).toShort()
+                val v = mixBuffer[i]
+                val abs = if (v >= 0) v else -v
+                if (abs > peak) peak = abs
             }
 
-            // Write to single AudioTrack — WRITE_BLOCKING paces the loop
-            // at exact hardware playback rate (~100ms per 4800-sample frame)
+            if (peak > Short.MAX_VALUE) {
+                // Scale all samples proportionally to prevent clipping
+                val scale = Short.MAX_VALUE.toFloat() / peak
+                for (i in 0 until stereoSamples) {
+                    outputShorts[i] = (mixBuffer[i] * scale).toInt().toShort()
+                }
+            } else {
+                for (i in 0 until stereoSamples) {
+                    outputShorts[i] = mixBuffer[i].toShort()
+                }
+            }
+
+            // Write FIXED-size frame to AudioTrack — WRITE_BLOCKING paces at 40ms
             val track = audioTrack
             if (track != null && track.playState == AudioTrack.PLAYSTATE_PLAYING) {
                 val written = track.write(outputShorts, 0, stereoSamples)
@@ -256,7 +362,9 @@ class StreamPlayer3(
                 mixCycleCount++
                 if (mixCycleCount % 50 == 1L) {
                     val queueSizes = jitterBuffers.entries.joinToString { "${it.key}=${it.value.size}" }
-                    Log.d(TAG, "MIX #$mixCycleCount active=$activeChannels frameSamples=$frameSamples written=$written queues=[$queueSizes]")
+                    val clipped = if (peak > Short.MAX_VALUE) "CLIPPED peak=$peak" else "peak=$peak"
+                    val underruns = try { track.underrunCount } catch (_: Exception) { -1 }
+                    Log.d(TAG, "MIX #$mixCycleCount active=$activeChannels written=$written $clipped underruns=$underruns underflows=$underflowCount queues=[$queueSizes]")
                 }
             } else {
                 try { Thread.sleep(10) } catch (_: InterruptedException) { break }
@@ -272,8 +380,8 @@ class StreamPlayer3(
         val minBufSize = AudioTrack.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT
         )
-        // Buffer for 4 frames: 4800 samples * 2 channels * 2 bytes/sample * 4 frames
-        val bufferSize = maxOf(minBufSize * 4, OPUS_MAX_FRAME_SIZE * 2 * 2 * 4)
+        // Buffer for 8 mixer frames: 1920 samples * 2 channels * 2 bytes/sample * 8 frames
+        val bufferSize = maxOf(minBufSize * 4, MIXER_FRAME_SIZE * 2 * 2 * 8)
 
         Log.d(TAG, "createAudioTrack: rate=$SAMPLE_RATE stereo 16bit minBuf=$minBufSize actualBuf=$bufferSize")
 

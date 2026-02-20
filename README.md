@@ -170,6 +170,7 @@ The core playback component with multi-room mixing support.
 - `jitterBuffers`: `ConcurrentHashMap<String, ConcurrentLinkedQueue<PcmFrame>>` - per-channel decoded PCM queues
 - `opusDecoders`: `ConcurrentHashMap<String, OpusDecoder>` - per-channel Opus decoder instances (each maintains internal state)
 - `channelVolumes`: `ConcurrentHashMap<String, Float>` - per-channel volume (0.0 - 1.0)
+- `channelSpeakerTypes`: `ConcurrentHashMap<String, String>` - per-channel speaker pan ("left", "right", "center")
 - `channelPlaying`: `ConcurrentHashMap<String, Boolean>` - jitter gate state (set once on first connect, never reset)
 
 **Jitter buffer strategy:**
@@ -201,12 +202,14 @@ Manages both control (WebSocket) and data (UDP) connections.
 - Channel management UI (add, connect, remove channels)
 - WebSocket connection controls
 - Audio transmission start/stop buttons
+- Per-channel volume slider (SeekBar, 0-100%)
+- Per-channel speaker select buttons (L / C / R) for stereo panning
 - Runtime permission handling (`RECORD_AUDIO`)
 - RecyclerView for channel list with per-channel controls
 
 ### `Room.kt` / `Member.kt` - Data Models
 
-- `Room`: channel metadata (ID, name, join state, speaking state, members, volume)
+- `Room`: channel metadata (ID, name, join state, speaking state, members, volume, speakerType)
 - `Member`: participant info (authorization ID, name, speaking state)
 
 ### `WavWriter.java` - Local Recording
@@ -306,7 +309,7 @@ Sender → JSON → Base64(12-byte-IV + AES-GCM(Opus(PCM))) → UDP → Receiver
 | Bit depth | 16-bit PCM | `AudioFormat.ENCODING_PCM_16BIT` |
 | Opus max frame size | 4800 samples | 100ms at 48kHz |
 | Actual decoded frame | 4800 samples | 100ms per frame |
-| Playback output | Stereo | Mono duplicated to L+R |
+| Playback output | Stereo | Mono panned to L, R, or both (center) per channel |
 | AudioTrack buffer | max(minBuf*4, 76800) | ~400ms buffer headroom |
 | Jitter buffer gate | 3 frames | ~300ms initial buffering |
 | Max queue size | 20 frames | ~2 seconds cap |
@@ -333,12 +336,13 @@ The application supports simultaneous playback from multiple rooms/channels usin
 For each active channel:
   1. Poll one PcmFrame from channel's jitter buffer
   2. Apply channel volume (0.0 - 1.0)
-  3. Sum mono samples into IntArray accumulator (L+R interleaved)
+  3. Apply speaker type: "center" → both L+R, "left" → L only, "right" → R only
+  4. Sum into IntArray accumulator (L+R interleaved)
 
 After all channels:
-  4. Clamp each sample to [-32768, 32767]
-  5. Write stereo ShortArray to AudioTrack (WRITE_BLOCKING)
-  6. Blocking write paces loop at ~100ms per frame
+  5. Clamp each sample to [-32768, 32767]
+  6. Write stereo ShortArray to AudioTrack (WRITE_BLOCKING)
+  7. Blocking write paces loop at ~100ms per frame
 ```
 
 ### Jitter Buffer Behavior
@@ -404,5 +408,9 @@ Channel first seen → frames arrive → queue grows
    - Incoming audio from all connected rooms plays automatically
    - Multiple rooms are mixed together in real-time
 
-5. **Volume control**:
-   - Per-channel volume can be set programmatically via `StreamPlayer3.setVolume(channelID, volume)`
+5. **Per-room controls**:
+   - **Volume slider**: Drag the SeekBar on each channel card to adjust volume (0-100%)
+   - **Speaker select**: Tap **L** / **C** / **R** buttons to pan audio:
+     - **L** — Left ear only
+     - **C** — Center (both ears, default)
+     - **R** — Right ear only
