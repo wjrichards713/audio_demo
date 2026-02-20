@@ -205,14 +205,17 @@ class StreamPlayer3(
         val mixBuffer = IntArray(stereoSamples)       // int accumulator to avoid clipping during sum
         val outputShorts = ShortArray(stereoSamples)   // final 16-bit output
 
-        // Per-channel remainder buffer for frames larger than MIXER_FRAME_SIZE
-        // (e.g. iOS sends 4800-sample frames, we consume 1920 per cycle).
-        // Accessed only from this thread — plain HashMap is fine.
-        val remainders = HashMap<String, ShortArray>()
+        // Per-channel accumulation buffer: decoded PCM is accumulated here until
+        // we have a full MIXER_FRAME_SIZE worth. This eliminates partial-frame
+        // discontinuities when frame sizes don't divide evenly into MIXER_FRAME_SIZE
+        // (e.g. 4800-sample frames / 1920 mixer = 2.5 — the old remainder approach
+        // would produce a 960-sample partial frame every 3rd cycle = crackling).
+        val accBuffers = HashMap<String, ShortArray>()
+        val accCounts = HashMap<String, Int>()
 
         // Per-channel crossfade state: prevents clicks when a channel briefly
-        // has no data (queue empty). Tracks whether channel had data in the
-        // previous cycle and the last sample value for smooth fade-out/fade-in.
+        // has no data. Tracks whether channel produced a full frame last cycle
+        // and the last sample value for smooth fade-out/fade-in.
         val channelHadData = HashMap<String, Boolean>()
         val channelLastSample = HashMap<String, Int>()
         var underflowCount = 0L
@@ -236,76 +239,56 @@ class StreamPlayer3(
                     }
                 }
 
+                // Phase 1: Accumulate decoded PCM from queue into per-channel buffer
+                val accBuf = accBuffers.getOrPut(channelID) { ShortArray(OPUS_MAX_FRAME_SIZE * 2) }
+                var accCount = accCounts[channelID] ?: 0
+
+                while (accCount < MIXER_FRAME_SIZE) {
+                    val frame = queue.poll() ?: break
+                    frame.pcmData.copyInto(accBuf, accCount)
+                    accCount += frame.pcmData.size
+                }
+
+                // Phase 2: Mix only if we have a full MIXER_FRAME_SIZE worth of data.
+                // This guarantees every channel always contributes exactly 1920 or 0
+                // samples per cycle — no partial frames, no mid-frame discontinuities.
                 val volume = channelVolumes[channelID] ?: 1.0f
                 val spkType = channelSpeakerTypes[channelID] ?: "center"
                 val hadData = channelHadData[channelID] ?: false
-                val needFadeIn = !hadData  // first data after a gap — ramp in
-                var offset = 0
-                var lastMixedSample = 0
 
-                // 1. Mix any leftover samples from the previous cycle's partial frame
-                val rem = remainders.remove(channelID)
-                if (rem != null) {
-                    val usable = minOf(rem.size, MIXER_FRAME_SIZE)
-                    for (i in 0 until usable) {
-                        var sample = (rem[i] * volume).toInt()
-                        if (needFadeIn && (offset + i) < FADE_SAMPLES) {
-                            sample = sample * (offset + i) / FADE_SAMPLES
+                if (accCount >= MIXER_FRAME_SIZE) {
+                    val needFadeIn = !hadData
+                    var lastSample = 0
+
+                    for (i in 0 until MIXER_FRAME_SIZE) {
+                        var sample = (accBuf[i] * volume).toInt()
+                        if (needFadeIn && i < FADE_SAMPLES) {
+                            sample = sample * i / FADE_SAMPLES
                         }
-                        lastMixedSample = sample
+                        lastSample = sample
                         when (spkType) {
-                            "left"  -> mixBuffer[(offset + i) * 2] += sample
-                            "right" -> mixBuffer[(offset + i) * 2 + 1] += sample
+                            "left"  -> mixBuffer[i * 2] += sample
+                            "right" -> mixBuffer[i * 2 + 1] += sample
                             else -> {
-                                mixBuffer[(offset + i) * 2] += sample
-                                mixBuffer[(offset + i) * 2 + 1] += sample
+                                mixBuffer[i * 2] += sample
+                                mixBuffer[i * 2 + 1] += sample
                             }
                         }
                     }
-                    offset += usable
-                    if (usable < rem.size) {
-                        remainders[channelID] = rem.copyOfRange(usable, rem.size)
+
+                    // Shift remaining data to front of buffer
+                    val remaining = accCount - MIXER_FRAME_SIZE
+                    if (remaining > 0) {
+                        System.arraycopy(accBuf, MIXER_FRAME_SIZE, accBuf, 0, remaining)
                     }
-                }
+                    accCount = remaining
 
-                // 2. Poll frames until we reach MIXER_FRAME_SIZE (1920) samples — NOT 4800.
-                //    This ensures consistent 40ms output and prevents greedy consumption
-                //    that would drain queues and cause intermittent channel dropouts.
-                while (offset < MIXER_FRAME_SIZE) {
-                    val frame = queue.poll() ?: break
-                    val available = frame.pcmData.size
-                    val usable = minOf(available, MIXER_FRAME_SIZE - offset)
-
-                    for (i in 0 until usable) {
-                        var sample = (frame.pcmData[i] * volume).toInt()
-                        if (needFadeIn && (offset + i) < FADE_SAMPLES) {
-                            sample = sample * (offset + i) / FADE_SAMPLES
-                        }
-                        lastMixedSample = sample
-                        when (spkType) {
-                            "left"  -> mixBuffer[(offset + i) * 2] += sample
-                            "right" -> mixBuffer[(offset + i) * 2 + 1] += sample
-                            else -> {
-                                mixBuffer[(offset + i) * 2] += sample
-                                mixBuffer[(offset + i) * 2 + 1] += sample
-                            }
-                        }
-                    }
-                    offset += usable
-
-                    // Save unused tail of the frame for the next cycle
-                    if (usable < available) {
-                        remainders[channelID] = frame.pcmData.copyOfRange(usable, available)
-                    }
-                }
-
-                if (offset > 0) {
-                    // Channel produced audio — save state for crossfade
                     channelHadData[channelID] = true
-                    channelLastSample[channelID] = lastMixedSample
+                    channelLastSample[channelID] = lastSample
                     activeChannels++
                 } else if (hadData) {
-                    // Channel just went empty — generate fade-out to prevent click
+                    // Channel just went from active to not-enough-data.
+                    // Generate fade-out to prevent click from abrupt silence.
                     val lastSample = channelLastSample[channelID] ?: 0
                     if (lastSample != 0) {
                         for (i in 0 until FADE_SAMPLES) {
@@ -322,10 +305,12 @@ class StreamPlayer3(
                         activeChannels++  // count as active during fade-out
                     }
                     underflowCount++
-                    Log.w(TAG, "UNDERFLOW ch=$channelID #$underflowCount lastSample=$lastSample")
+                    Log.w(TAG, "UNDERFLOW ch=$channelID #$underflowCount lastSample=$lastSample accCount=$accCount")
                     channelHadData[channelID] = false
                     channelLastSample[channelID] = 0
                 }
+
+                accCounts[channelID] = accCount
             }
 
             if (activeChannels == 0) {
