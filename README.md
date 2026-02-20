@@ -310,8 +310,9 @@ Sender → JSON → Base64(12-byte-IV + AES-GCM(Opus(PCM))) → UDP → Receiver
 | Opus max frame size | 4800 samples | 100ms at 48kHz |
 | Actual decoded frame | 4800 samples | 100ms per frame |
 | Playback output | Stereo | Mono panned to L, R, or both (center) per channel |
-| AudioTrack buffer | max(minBuf*4, 76800) | ~400ms buffer headroom |
-| Jitter buffer gate | 3 frames | ~300ms initial buffering |
+| Mixer frame size | 1920 samples | 40ms fixed output per mix cycle |
+| AudioTrack buffer | max(minBuf*4, 61440) | ~320ms buffer headroom |
+| Jitter buffer gate | 5 frames | ~200ms initial buffering |
 | Max queue size | 20 frames | ~2 seconds cap |
 
 ---
@@ -326,23 +327,36 @@ The application supports simultaneous playback from multiple rooms/channels usin
 |---|---|
 | **Single AudioTrack** | Multiple AudioTracks cause device-dependent noise from Android HAL mixing |
 | **No timestamp-based writes** | `WRITE_BLOCKING` naturally paces at hardware playback rate |
-| **Software mixing in IntArray** | Int accumulator prevents clipping; final clamp to 16-bit range |
+| **Software mixing in IntArray** | Int accumulator prevents clipping during summation |
+| **Peak limiter** | Normalizes frame if peak > 32767 instead of hard-clipping individual samples |
 | **Per-channel Opus decoders** | Each decoder maintains independent state for its stream |
 | **One-time jitter gate** | Re-gating after brief gaps caused 300ms audible breaks |
+| **Fixed 1920-sample mixer output** | Variable-size writes (1920/3840/4800) caused timing jitter and queue drain |
+| **Accumulation buffer (not remainder)** | Remainder approach caused partial frames when frame sizes don't divide evenly (4800/1920=2.5) |
+| **Crossfade on transitions** | 64-sample fade-out/fade-in when channel goes empty/returns prevents clicks |
 
 ### Mixing Flow (per cycle)
 
 ```
 For each active channel:
-  1. Poll one PcmFrame from channel's jitter buffer
-  2. Apply channel volume (0.0 - 1.0)
-  3. Apply speaker type: "center" → both L+R, "left" → L only, "right" → R only
-  4. Sum into IntArray accumulator (L+R interleaved)
+  Phase 1 — Accumulate:
+    1. Fill per-channel accumulation buffer from jitter queue
+    2. Only proceed if accBuffer >= 1920 samples (full mixer frame)
+
+  Phase 2 — Mix (only if full frame available):
+    3. Apply channel volume (0.0 - 1.0)
+    4. Apply fade-in if channel is returning from empty (64-sample ramp)
+    5. Apply speaker type: "center" → both L+R, "left" → L only, "right" → R only
+    6. Sum into IntArray accumulator (L+R interleaved)
+    7. Shift remaining data in accBuffer to front (System.arraycopy)
+
+  If not enough data:
+    - Generate 64-sample fade-out from last sample value → 0
+    - Log UNDERFLOW warning
 
 After all channels:
-  5. Clamp each sample to [-32768, 32767]
-  6. Write stereo ShortArray to AudioTrack (WRITE_BLOCKING)
-  7. Blocking write paces loop at ~100ms per frame
+  8. Peak limiter: if max |sample| > 32767, scale entire frame proportionally
+  9. Write fixed 3840 stereo shorts to AudioTrack (WRITE_BLOCKING paces at 40ms)
 ```
 
 ### Jitter Buffer Behavior
@@ -350,19 +364,84 @@ After all channels:
 ```
 Channel first seen → frames arrive → queue grows
                                         │
-                              queue >= 3 frames?
+                              queue >= 5 frames?
                               ├── No  → skip (wait)
                               └── Yes → gate OPEN (permanent)
                                         │
                                   ┌──────▼──────┐
-                                  │ Normal play  │◄──── frames arrive
-                                  │ poll & mix   │
+                                  │ Accumulate   │◄──── frames arrive
+                                  │ into accBuf  │
                                   └──────┬──────┘
                                          │
-                                  queue empty?
-                                  ├── Yes → skip (silence), gate stays OPEN
-                                  └── No  → poll & mix next frame
+                                accBuf >= 1920?
+                                ├── No  → fade-out if was active, log UNDERFLOW
+                                └── Yes → mix 1920 samples, shift remainder
 ```
+
+### Diagnostic Logging
+
+The mixer logs diagnostic info every 50th cycle:
+```
+MIX #N active=2 written=3840 peak=12345 underruns=0 underflows=0 queues=[555=4, 666=3]
+```
+
+| Field | Meaning |
+|---|---|
+| `active` | Number of channels that contributed audio this cycle |
+| `written` | Stereo shorts written to AudioTrack (always 3840) |
+| `peak` | Max absolute sample value before limiting |
+| `underruns` | AudioTrack hardware underrun count (API 24+) |
+| `underflows` | Cumulative count of channel queue-empty events |
+| `queues` | Per-channel jitter buffer sizes at time of logging |
+
+Warning logs:
+- `UNDERFLOW ch=X #N lastSample=Y accCount=Z` — channel had insufficient data for a full mixer frame
+
+---
+
+## Crackling Debug History (Feb 2026)
+
+This section documents the multi-session debugging effort to fix audio crackling when 2+ channels play simultaneously. Kept for reference if the issue needs further investigation.
+
+### Issue 1: Multiple AudioTracks (FIXED)
+- **Symptom**: Noise/artifacts when 2+ rooms play simultaneously
+- **Cause**: Android HAL mixing of multiple AudioTracks introduces device-dependent noise
+- **Fix**: Single AudioTrack with software mixing in `StreamPlayer3.kt`
+
+### Issue 2: Timestamp offset mismatch (FIXED)
+- **Symptom**: Overlap/gap artifacts in audio
+- **Cause**: Code used 40ms frame duration but actual Opus frames are 100ms (4800 samples)
+- **Fix**: Corrected `OPUS_MAX_FRAME_SIZE` to 4800
+
+### Issue 3: Aggressive jitter re-gating (FIXED)
+- **Symptom**: 300ms audible breaks during natural speech pauses
+- **Cause**: Jitter gate re-closed after 500ms idle, requiring 3 frames (300ms) to re-open
+- **Fix**: Jitter gate opens once on first connect, stays open permanently
+
+### Issue 4: Variable-size mixer output (FIXED)
+- **Symptom**: Crackling when 2 channels active, queues climbing to 10-12
+- **Cause**: Greedy accumulation consumed up to 4800 samples/cycle, creating variable writes (3840/7680/9600 shorts). Feast/famine queue oscillation caused intermittent channel dropouts.
+- **Fix**: Fixed `MIXER_FRAME_SIZE = 1920` (40ms), consistent 3840-short writes
+
+### Issue 5: Partial frames from frame size mismatch (FIXED)
+- **Symptom**: Crackling persisted after fix 4, 42 underflows in 4 minutes
+- **Cause**: Some devices send 4800-sample frames (100ms). 4800/1920 = 2.5 — doesn't divide evenly. Old remainder approach produced 960-sample partial frames every 3rd cycle, creating mid-frame silence discontinuities.
+- **Fix**: Accumulation buffer — only mix when full 1920 samples available. Partial data stays in buffer for next cycle.
+- **Logs confirmed**: `pcmSamples=4800` for channel 666 despite "all Android" test, `underflows=42` during session
+
+### Issue 6: Remaining minor crackling (UNDER INVESTIGATION)
+- **Status**: Much improved but occasional crackling still reported
+- **Observations from logs**:
+  - `underruns=1-2` (AudioTrack hardware underruns) — could be GC pauses or thread scheduling
+  - `underflows` still > 0 during extended playback — network jitter can still drain accumulation buffer
+  - Peak values well under 32767 — clipping is NOT a factor
+- **Potential next steps**:
+  1. Increase jitter buffer further (5 → 8 frames) for more cushion
+  2. Add volume smoothing (ramp between old/new volume across frame boundary to prevent clicks during slider drag)
+  3. Investigate if crackling correlates with `UNDERFLOW` log entries
+  4. Try `PERFORMANCE_MODE_LOW_LATENCY` on AudioTrack
+  5. Profile GC pressure from per-packet allocations (ShortArray, PcmFrame, copyOf)
+  6. Consider reducing MIXER_FRAME_SIZE to 960 (GCD of 1920 and 4800) for perfect alignment with all frame sizes
 
 ---
 
