@@ -25,8 +25,8 @@ class StreamPlayer3(
     companion object {
         private const val TAG = "SP3"
         private const val OPUS_MAX_FRAME_SIZE = 4800   // 100ms at 48kHz mono (for Opus decoder)
-        private const val MIXER_FRAME_SIZE = 1920      // 40ms at 48kHz — fixed output per mix cycle
-        private const val JITTER_BUFFER_MIN_FRAMES = 5 // Wait for this many before starting playback
+        private const val MIXER_FRAME_SIZE = 960       // 20ms at 48kHz — GCD of 1920/2880/4800 for perfect alignment
+        private const val JITTER_BUFFER_MIN_FRAMES = 8 // Wait for this many before starting playback
         private const val FADE_SAMPLES = 64            // Crossfade length (~1.3ms at 48kHz)
         private const val CHANNEL_IDLE_TIMEOUT_MS = 500L
         private const val MAX_QUEUE_SIZE = 20
@@ -44,6 +44,7 @@ class StreamPlayer3(
     // Per-channel state (receive side — same as working single-room code)
     private val jitterBuffers = ConcurrentHashMap<String, ConcurrentLinkedQueue<PcmFrame>>()
     private val opusDecoders = ConcurrentHashMap<String, OpusDecoder>()
+    private val decodeBuffers = ConcurrentHashMap<String, ShortArray>() // reusable decode buffers — reduces GC
     private val channelVolumes = ConcurrentHashMap<String, Float>()
     private val channelSpeakerTypes = ConcurrentHashMap<String, String>()
     private val channelLastReceiveTime = ConcurrentHashMap<String, Long>()
@@ -144,6 +145,7 @@ class StreamPlayer3(
 
         opusDecoders.values.forEach { try { it.close() } catch (_: Exception) {} }
         opusDecoders.clear()
+        decodeBuffers.clear()
         jitterBuffers.clear()
         channelPlaying.clear()
         channelLastReceiveTime.clear()
@@ -218,6 +220,7 @@ class StreamPlayer3(
         // and the last sample value for smooth fade-out/fade-in.
         val channelHadData = HashMap<String, Boolean>()
         val channelLastSample = HashMap<String, Int>()
+        val channelPrevVolume = HashMap<String, Float>()  // for volume smoothing across frames
         var underflowCount = 0L
 
         while (keepPlaying) {
@@ -260,8 +263,14 @@ class StreamPlayer3(
                     val needFadeIn = !hadData
                     var lastSample = 0
 
+                    // Volume smoothing: ramp from previous volume to current across the frame.
+                    // Prevents clicks/pops when user drags the volume slider.
+                    val prevVol = channelPrevVolume[channelID] ?: volume
+                    val volStep = (volume - prevVol) / MIXER_FRAME_SIZE
+
                     for (i in 0 until MIXER_FRAME_SIZE) {
-                        var sample = (accBuf[i] * volume).toInt()
+                        val vol = prevVol + volStep * i
+                        var sample = (accBuf[i] * vol).toInt()
                         if (needFadeIn && i < FADE_SAMPLES) {
                             sample = sample * i / FADE_SAMPLES
                         }
@@ -275,6 +284,7 @@ class StreamPlayer3(
                             }
                         }
                     }
+                    channelPrevVolume[channelID] = volume
 
                     // Shift remaining data to front of buffer
                     val remaining = accCount - MIXER_FRAME_SIZE
@@ -365,12 +375,13 @@ class StreamPlayer3(
         val minBufSize = AudioTrack.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT
         )
-        // Buffer for 8 mixer frames: 1920 samples * 2 channels * 2 bytes/sample * 8 frames
-        val bufferSize = maxOf(minBufSize * 4, MIXER_FRAME_SIZE * 2 * 2 * 8)
+        // Buffer for 24 mixer frames: 960 samples * 2 channels * 2 bytes/sample * 24 frames = ~480ms
+        // Larger buffer gives more headroom against GC pauses and thread scheduling delays
+        val bufferSize = maxOf(minBufSize * 4, MIXER_FRAME_SIZE * 2 * 2 * 24)
 
         Log.d(TAG, "createAudioTrack: rate=$SAMPLE_RATE stereo 16bit minBuf=$minBufSize actualBuf=$bufferSize")
 
-        return AudioTrack.Builder()
+        val builder = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -386,7 +397,8 @@ class StreamPlayer3(
             )
             .setBufferSizeInBytes(bufferSize)
             .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
+
+        return builder.build()
     }
 
     // =========================================================================
@@ -401,11 +413,14 @@ class StreamPlayer3(
         if (isNew) {
             Log.d(TAG, "NEW OpusDecoder ch=$channelID rate=$SAMPLE_RATE channels=1 maxFrame=$OPUS_MAX_FRAME_SIZE")
         }
-        val decodedData = ShortArray(OPUS_MAX_FRAME_SIZE)
+        // Reuse per-channel decode buffer to reduce GC pressure
+        // (was allocating ShortArray(4800) = 9.6KB per packet before)
+        val decodedData = decodeBuffers.getOrPut(channelID) { ShortArray(OPUS_MAX_FRAME_SIZE) }
         val size = decoder.decode(encodedData, decodedData)
         if (size <= 0 && totalDecodeErrors < 10) {
             Log.w(TAG, "Opus decode failed ch=$channelID encodedSize=${encodedData.size} returned=$size")
         }
+        // copyOf still needed — data goes into async queue consumed by mixer thread
         return if (size > 0) decodedData.copyOf(size) else ShortArray(0)
     }
 
